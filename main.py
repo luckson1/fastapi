@@ -15,7 +15,6 @@ async def root():
 
 @app.post("/youtube/")
 def load_youtube_transcript(request: YouTubeTranscriptRequest):
-    print(request.json())
     loader = YoutubeLoader.from_youtube_url(
         request.url,
         add_video_info=True,
