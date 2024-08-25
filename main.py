@@ -1,21 +1,27 @@
 from fastapi import FastAPI
 from langchain_community.document_loaders.youtube import YoutubeLoader, TranscriptFormat
 from fastapi.openapi.utils import get_openapi
+from pydantic import BaseModel
+
+class YouTubeTranscriptRequest(BaseModel):
+    url: str
 
 app = FastAPI()
+
 
 @app.get("/")
 async def root():
     return {"greeting": "Hello, World!", "message": "Welcome to FastAPI!"}
 
 @app.post("/youtube/")
-def load_youtube_transcript(url: str):
+def load_youtube_transcript(request: YouTubeTranscriptRequest):
+    print(request.json())
     loader = YoutubeLoader.from_youtube_url(
-        url,
+        request.url,
         add_video_info=True,
         transcript_format=TranscriptFormat.CHUNKS,
         chunk_size_seconds=60,
-          language=["en", "en-US", "es", "es-ES", "zh", "zh-CN", "de", "de-DE", "fr", "fr-FR", "ar", "ar-SA"],
+        language=["en", "en-US", "es", "es-ES", "zh", "zh-CN", "de", "de-DE", "fr", "fr-FR", "ar", "ar-SA"],
     )
     docs = loader.load()
     return docs
