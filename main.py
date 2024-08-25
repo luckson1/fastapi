@@ -15,6 +15,7 @@ def load_youtube_transcript(url: str):
         add_video_info=True,
         transcript_format=TranscriptFormat.CHUNKS,
         chunk_size_seconds=60,
+          language=["en", "en-US", "es", "es-ES", "zh", "zh-CN", "de", "de-DE", "fr", "fr-FR", "ar", "ar-SA"],
     )
     docs = loader.load()
     return docs
