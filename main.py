@@ -17,7 +17,7 @@ async def root():
 def load_youtube_transcript(request: YouTubeTranscriptRequest):
     loader = YoutubeLoader.from_youtube_url(
         request.url,
-        add_video_info=True,
+        # add_video_info=True,
         transcript_format=TranscriptFormat.CHUNKS,
         chunk_size_seconds=60,
         language=["en", "en-US", "es", "es-ES", "zh", "zh-CN", "de", "de-DE", "fr", "fr-FR", "ar", "ar-SA"],
