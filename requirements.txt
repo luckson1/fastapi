@@ -3,3 +3,9 @@ hypercorn==0.14.4
 langchain_community
 youtube-transcript-api
 pytube
+python-dotenv
+boto3
+llama-parse
+llama-index-core
+llama-index-readers-file
+pydantic
