@@ -9,3 +9,4 @@ llama-parse
 llama-index-core
 llama-index-readers-file
 pydantic
+markitdown

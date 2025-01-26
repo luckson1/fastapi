@@ -8,6 +8,7 @@ import boto3
 import tempfile
 from llama_parse import LlamaParse
 from llama_index.core import SimpleDirectoryReader
+from markitdown import MarkItDown
 
 class YouTubeTranscriptRequest(BaseModel):
     url: str
@@ -78,6 +79,39 @@ async def get_chunked_ocr(request: S3DocumentRequest):
         print(f"Error: {str(e)}")
         raise HTTPException (status_code=500, detail="File docs chunking failed!")
 
+class MarkdownRequest(BaseModel):
+    key: str
+    name: str
+
+@app.post("/convert-markdown/")
+async def convert_to_markdown(request: MarkdownRequest):
+    try:
+        # Initialize S3 client
+        s3_client = boto3.client('s3')
+        
+        # Get file from S3
+        s3_response = s3_client.get_object(
+            Bucket=os.getenv('BUCKET_NAME'),
+            Key=request.key
+        )
+        
+        # Create temporary file
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_file_path = os.path.join(temp_dir, request.name)
+            
+            # Write S3 content to temporary file
+            with open(temp_file_path, 'wb') as f:
+                f.write(s3_response['Body'].read())
+            
+            # Initialize MarkItDown and convert
+            md = MarkItDown()
+            result = md.convert(temp_file_path)
+            
+            return {"markdown_content": result.text_content}
+            
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Markdown conversion failed!")
 
 def custom_openapi():
     if app.openapi_schema:
