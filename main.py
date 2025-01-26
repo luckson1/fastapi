@@ -91,7 +91,7 @@ async def convert_to_markdown(request: MarkdownRequest):
         
         # Get file from S3
         s3_response = s3_client.get_object(
-            Bucket=os.getenv('BUCKET_NAME'),
+            Bucket="jenga",
             Key=request.key
         )
         
