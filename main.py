@@ -86,6 +86,11 @@ class MarkdownRequest(BaseModel):
 @app.post("/convert-markdown/")
 async def convert_to_markdown(request: MarkdownRequest):
     try:
+
+        # Debug: Print environment variables
+        print("AWS Access Key:", os.getenv('AWS_ACCESS_KEY_ID'))
+        print("AWS Region:", os.getenv('AWS_DEFAULT_REGION'))
+        print("Bucket Name:", os.getenv('BUCKET_NAME'))
         # Initialize S3 client
 
         s3_client = boto3.client(
