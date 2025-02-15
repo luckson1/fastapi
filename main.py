@@ -31,7 +31,7 @@ def load_youtube_transcript(request: YouTubeTranscriptRequest):
             language=["en", "en-US", "es", "es-ES", "zh", "zh-CN", "de", "de-DE", "fr", "fr-FR", "ar", "ar-SA"],
         )
         docs = loader.load()
-        print(docs)
+     
         return docs
     except Exception as e:
         print(f"Error: {str(e)}")
