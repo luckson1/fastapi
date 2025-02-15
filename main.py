@@ -22,15 +22,20 @@ async def root():
 
 @app.post("/youtube/")
 def load_youtube_transcript(request: YouTubeTranscriptRequest):
-    loader = YoutubeLoader.from_youtube_url(
-        request.url,
-        # add_video_info=True,
-        transcript_format=TranscriptFormat.CHUNKS,
-        chunk_size_seconds=60,
-        language=["en", "en-US", "es", "es-ES", "zh", "zh-CN", "de", "de-DE", "fr", "fr-FR", "ar", "ar-SA"],
-    )
-    docs = loader.load()
-    return docs
+    try:
+        loader = YoutubeLoader.from_youtube_url(
+            request.url,
+            # add_video_info=True,
+            transcript_format=TranscriptFormat.CHUNKS,
+            chunk_size_seconds=60,
+            language=["en", "en-US", "es", "es-ES", "zh", "zh-CN", "de", "de-DE", "fr", "fr-FR", "ar", "ar-SA"],
+        )
+        docs = loader.load()
+        print(docs)
+        return docs
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to load YouTube transcript")
 
 class S3DocumentRequest(BaseModel):
     key: str
