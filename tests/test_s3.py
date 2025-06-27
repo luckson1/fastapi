@@ -12,14 +12,14 @@ def aws_credentials():
     os.environ["AWS_SECURITY_TOKEN"] = "testing"
     os.environ["AWS_SESSION_TOKEN"] = "testing"
     os.environ["AWS_REGION_ADS"] = "us-east-1"
-    os.environ["SCREENSHOT_BUCKET"] = "test-screenshot-bucket"
+    os.environ["S3_BUCKET_NAME_ADS"] = "test-screenshot-bucket"
 
 @pytest.fixture
 def s3_client(aws_credentials):
     """Mocked S3 client."""
     with mock_aws():
         client = boto3.client("s3", region_name="us-east-1")
-        client.create_bucket(Bucket=os.environ["SCREENSHOT_BUCKET"])
+        client.create_bucket(Bucket=os.environ["S3_BUCKET_NAME_ADS"])
         yield client
 
 def test_s3_upload(s3_client):
@@ -37,6 +37,6 @@ def test_s3_upload(s3_client):
     assert object_key.endswith(".png")
     
     # Verify the object exists in the mock bucket and has the correct content
-    response = s3_client.get_object(Bucket=os.environ["SCREENSHOT_BUCKET"], Key=object_key)
+    response = s3_client.get_object(Bucket=os.environ["S3_BUCKET_NAME_ADS"], Key=object_key)
     assert response["Body"].read() == dummy_bytes
     assert response["ContentType"] == "image/png" 

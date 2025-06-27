@@ -7,10 +7,10 @@ class S3Storage:
     """A wrapper for Boto3 to handle S3 operations."""
     def __init__(self, region_name=None, bucket_name=None):
         self.region_name = region_name or os.getenv("AWS_REGION_ADS")
-        self.bucket_name = bucket_name or os.getenv("SCREENSHOT_BUCKET")
+        self.bucket_name = bucket_name or os.getenv("S3_BUCKET_NAME_ADS")
         
         if not self.region_name or not self.bucket_name:
-            raise ValueError("AWS region and S3 bucket name must be configured.")
+            raise ValueError("AWS region and S3  name must be configured.")
             
         self.s3_client = boto3.client(
             "s3",
