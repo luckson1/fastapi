@@ -3,7 +3,7 @@
   "build": {
     "builder": "NIXPACKS",
     "nixpacks": {
-      "installCmd": "pip install -r requirements.txt && playwright install chromium"
+      "buildCmd": "playwright install chromium"
     }
   },
   "deploy": {
