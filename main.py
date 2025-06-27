@@ -113,6 +113,9 @@ async def take_screenshot(request: ScreenshotRequest, storage: S3Storage = Depen
         logger.info("Starting screenshot capture", extra=log_extra)
         result = await capture_full_page(str(request.url))
 
+        # Calculate file size in KB
+        file_size_kb = len(result.image_bytes) / 1024
+
         # 2. Store in S3
         s3_key = storage.upload_file(result.image_bytes)
         log_extra["s3_key"] = s3_key
@@ -124,6 +127,7 @@ async def take_screenshot(request: ScreenshotRequest, storage: S3Storage = Depen
             "s3_key": s3_key,
             "width": result.width,
             "height": result.height,
+            "file_size_kb": round(file_size_kb, 2),
             "captured_at": datetime.now(timezone.utc).isoformat(),
         }
 
