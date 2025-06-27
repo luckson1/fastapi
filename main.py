@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status, Depends
 from langchain_community.document_loaders.youtube import YoutubeLoader, TranscriptFormat
 from fastapi.openapi.utils import get_openapi
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl, Field
 import os
 from dotenv import load_dotenv
 import boto3
@@ -9,12 +9,38 @@ import tempfile
 from llama_parse import LlamaParse
 from llama_index.core import SimpleDirectoryReader
 from markitdown import MarkItDown
+from datetime import datetime, timezone
+from app.screenshot.capture import capture_full_page, ScreenshotError
+from app.storage.s3 import S3Storage
+from app.metrics.prom import (
+    SCREENSHOT_REQUESTS_TOTAL,
+    SCREENSHOT_SUCCESS_TOTAL,
+    SCREENSHOT_FAILURE_TOTAL,
+    SCREENSHOT_LATENCY_SECONDS,
+)
+import time
+from prometheus_client import make_asgi_app
+import logging
+
+# Configure structured logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Create a separate app for the metrics endpoint
+metrics_app = make_asgi_app()
+
+# Dependency to get S3 storage instance
+def get_s3_storage():
+    return S3Storage()
 
 class YouTubeTranscriptRequest(BaseModel):
     url: str
 
-app = FastAPI()
+class ScreenshotRequest(BaseModel):
+    url: HttpUrl = Field(..., max_length=2048)
 
+app = FastAPI()
+app.mount("/metrics", metrics_app)
 
 @app.get("/")
 async def root():
@@ -72,6 +98,50 @@ async def convert_to_markdown(request: MarkdownRequest):
     except Exception as e:
         print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail="Markdown conversion failed!")
+
+@app.post("/v1/screenshot", status_code=status.HTTP_201_CREATED)
+async def take_screenshot(request: ScreenshotRequest, storage: S3Storage = Depends(get_s3_storage)):
+    """
+    Accepts a URL, validates it, captures a screenshot, and stores it in S3.
+    """
+    SCREENSHOT_REQUESTS_TOTAL.inc()
+    start_time = time.time()
+    log_extra = {"url": str(request.url)}
+
+    try:
+        # 1. Capture the screenshot
+        logger.info("Starting screenshot capture", extra=log_extra)
+        result = await capture_full_page(str(request.url))
+
+        # 2. Store in S3
+        s3_key = storage.upload_file(result.image_bytes)
+        log_extra["s3_key"] = s3_key
+        logger.info("Screenshot capture and upload successful", extra=log_extra)
+
+        # 3. Return the structured response
+        SCREENSHOT_SUCCESS_TOTAL.inc()
+        return {
+            "s3_key": s3_key,
+            "width": result.width,
+            "height": result.height,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except ScreenshotError as e:
+        log_extra["error"] = str(e)
+        logger.error("Screenshot capture failed", extra=log_extra)
+        SCREENSHOT_FAILURE_TOTAL.inc()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Screenshot capture failed: {e}")
+    except Exception as e:
+        log_extra["error"] = str(e)
+        logger.error("An unexpected error occurred", extra=log_extra)
+        SCREENSHOT_FAILURE_TOTAL.inc()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
+    finally:
+        latency = time.time() - start_time
+        log_extra["latency_seconds"] = latency
+        logger.info("Screenshot request finished", extra=log_extra)
+        SCREENSHOT_LATENCY_SECONDS.observe(latency)
 
 def custom_openapi():
     if app.openapi_schema:

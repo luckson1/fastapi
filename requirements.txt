@@ -10,3 +10,9 @@ llama-index-core
 llama-index-readers-file
 pydantic
 markitdown[all]
+playwright
+prometheus-client
+pytest
+pytest-asyncio
+moto
+Pillow
