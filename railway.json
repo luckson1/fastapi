@@ -3,7 +3,7 @@
   "build": {
     "builder": "NIXPACKS",
     "nixpacks": {
-      "buildCmd": "playwright install chromium"
+      "buildCmd": ". /opt/venv/bin/activate && playwright install-deps && playwright install chromium"
     }
   },
   "deploy": {
