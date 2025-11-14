@@ -56,11 +56,11 @@ except Exception as e:  # pragma: no cover - guard rail for deployment misconfig
 try:
     # IMPORTANT: Set GOOGLE_GENERATIVE_AI_API_KEY (or GOOGLE_API_KEY) in Vercel.
     llm = ChatGoogleGenerativeAI(
-        model="gemini-flash",
+        model= "gemini-2.5-flash"
         temperature=0,
         google_api_key=GOOGLE_GENAI_KEY,
     )
-    structured_llm = llm.with_structured_output(schema=Topic.model_json_schema())
+    structured_llm = llm.with_structured_output(Topic)
     print("LLM initialized successfully.")
 except Exception as e:  # pragma: no cover - guard rail for deployment misconfig
     print(f"FATAL: Could not configure LangChain/Gemini model: {e}")
