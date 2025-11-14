@@ -70,7 +70,7 @@ except Exception as e:  # pragma: no cover - guard rail for deployment misconfig
 
 
 # IMPORTANT: Set your VERCEL_API_KEY as an environment variable in Vercel for security.
-AUTH_KEY = os.environ.get("VERCEL_API_KEY")
+AUTH_KEY = os.environ.get("AUTH_KEY")
 
 
 def _coerce_string_list(values: List, field_name: str, index: int) -> List[str]:
