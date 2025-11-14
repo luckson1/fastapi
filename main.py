@@ -56,7 +56,7 @@ except Exception as e:  # pragma: no cover - guard rail for deployment misconfig
 try:
     # IMPORTANT: Set GOOGLE_GENERATIVE_AI_API_KEY (or GOOGLE_API_KEY) in Vercel.
     llm = ChatGoogleGenerativeAI(
-        model= "gemini-2.5-flash"
+        model="gemini-2.5-flash",
         temperature=0,
         google_api_key=GOOGLE_GENAI_KEY,
     )
