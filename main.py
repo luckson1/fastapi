@@ -2,12 +2,15 @@ from collections import Counter
 from typing import List
 
 from fastapi import FastAPI, HTTPException, Request
+try:
+    from google import genai
+except ImportError:  # pragma: no cover - dependency guard for local tests
+    genai = None
 from langchain_community.document_loaders.youtube import YoutubeLoader, TranscriptFormat
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 import os
-from dotenv import load_dotenv
 import boto3
 import tempfile
 import json
@@ -15,13 +18,14 @@ from llama_parse import LlamaParse
 from llama_index.core import SimpleDirectoryReader
 from markitdown import MarkItDown
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 import logging
 import hdbscan
 import numpy as np
 from sklearn.decomposition import PCA
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.exceptions import OutputParserException
+
+# Load environment variables early for local development.
+load_dotenv()
 
 # Configure structured logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -32,6 +36,8 @@ logger = logging.getLogger(__name__)
 GOOGLE_GENAI_KEY = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY") or os.environ.get(
     "GOOGLE_API_KEY"
 )
+GENAI_EMBEDDING_MODEL = "gemini-embedding-001"
+GENAI_TEXT_MODEL = "gemini-2.5-flash"
 
 
 class Topic(BaseModel):
@@ -41,30 +47,20 @@ class Topic(BaseModel):
     topic_description: str = Field(description="A description of what this topic is about.")
 
 
-print("Initializing models...")
-try:
-    embedding_client = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=GOOGLE_GENAI_KEY,
-    )
-    print("Embeddings client ready.")
-except Exception as e:  # pragma: no cover - guard rail for deployment misconfig
-    print(f"FATAL: Could not configure Google embeddings: {e}")
-    embedding_client = None
-
-
-try:
-    # IMPORTANT: Set GOOGLE_GENERATIVE_AI_API_KEY (or GOOGLE_API_KEY) in Vercel.
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0,
-        google_api_key=GOOGLE_GENAI_KEY,
-    )
-    structured_llm = llm.with_structured_output(Topic)
-    print("LLM initialized successfully.")
-except Exception as e:  # pragma: no cover - guard rail for deployment misconfig
-    print(f"FATAL: Could not configure LangChain/Gemini model: {e}")
-    structured_llm = None
+print("Initializing Google GenAI client...")
+if not GOOGLE_GENAI_KEY:
+    print("FATAL: Google GenAI API key is not configured.")
+    genai_client = None
+elif genai is None:
+    print("FATAL: google-genai package is not installed.")
+    genai_client = None
+else:
+    try:
+        genai_client = genai.Client(api_key=GOOGLE_GENAI_KEY)
+        print("Google GenAI client ready.")
+    except Exception as e:  # pragma: no cover - guard rail for deployment misconfig
+        print(f"FATAL: Could not configure Google GenAI client: {e}")
+        genai_client = None
 
 
 # IMPORTANT: Set your VERCEL_API_KEY as an environment variable in Vercel for security.
@@ -95,8 +91,8 @@ def _coerce_string_list(values: List, field_name: str, index: int) -> List[str]:
 
 def _embed_texts(texts: List[str]) -> np.ndarray:
     """Batch texts through the Google embeddings API and return numpy arrays."""
-    if embedding_client is None:
-        raise RuntimeError("Embedding client is not configured.")
+    if genai_client is None:
+        raise RuntimeError("Google GenAI client is not configured.")
 
     if not texts:
         return np.zeros((0, 0), dtype=np.float32)
@@ -106,9 +102,36 @@ def _embed_texts(texts: List[str]) -> np.ndarray:
     for start in range(0, len(texts), batch_size):
         chunk = texts[start : start + batch_size]
         normalized_chunk = [text if text.strip() else " " for text in chunk]
-        embeddings.extend(embedding_client.embed_documents(normalized_chunk))
+        for text in normalized_chunk:
+            try:
+                response = genai_client.models.embed_content(
+                    model=GENAI_EMBEDDING_MODEL,
+                    contents=text,
+                )
+            except Exception as exc:  # pragma: no cover - API guard rail
+                raise RuntimeError("Failed to fetch embeddings from Google GenAI.") from exc
+
+            embeddings.append(_extract_embedding_vector(response))
 
     return np.asarray(embeddings, dtype=np.float32)
+
+
+def _extract_embedding_vector(response) -> List[float]:
+    """Normalize the embed_content response into a raw float vector."""
+    embeddings_data = getattr(response, "embeddings", None)
+    if embeddings_data:
+        first_entry = embeddings_data[0]
+        values = getattr(first_entry, "values", first_entry)
+        return list(values)
+
+    data_entries = getattr(response, "data", None)
+    if data_entries:
+        first_entry = data_entries[0]
+        embedding = getattr(first_entry, "embedding", first_entry)
+        values = getattr(embedding, "values", embedding)
+        return list(values)
+
+    raise RuntimeError("Embedding response did not include vector values.")
 
 
 def _reduce_and_normalize(vectors: np.ndarray) -> np.ndarray:
@@ -148,6 +171,35 @@ def _summarize_cluster(videos: List[dict]) -> dict:
         "key_phrases": top_values(phrase_counter),
         "visual_elements": top_values(visual_counter),
     }
+
+
+def _generate_cluster_topic(summaries_text: str, cluster_stats: dict) -> Topic:
+    """Use Google GenAI to summarize a single cluster into a Topic."""
+    if genai_client is None:
+        raise RuntimeError("Google GenAI client is not configured.")
+
+    prompt_text = (
+        "You are an expert market analyst. Name the dominant topic reflected by the cluster.\n"
+        "Return a concise title (no more than 3 words) plus a one-sentence description.\n"
+        f"Summaries:\n---\n{summaries_text}\n---\n"
+        f"Top keywords: {', '.join(cluster_stats['keywords']) or 'n/a'}\n"
+        f"Top key phrases: {', '.join(cluster_stats['key_phrases']) or 'n/a'}\n"
+        f"Visual elements: {', '.join(cluster_stats['visual_elements']) or 'n/a'}"
+    )
+
+    response = genai_client.models.generate_content(
+        model=GENAI_TEXT_MODEL,
+        contents=prompt_text,
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": Topic.model_json_schema(),
+        },
+    )
+    response_text = getattr(response, "text", "") or ""
+    if not response_text.strip():
+        raise RuntimeError("Google GenAI returned an empty response.")
+
+    return Topic.model_validate_json(response_text)
 
 class YouTubeTranscriptRequest(BaseModel):
     url: str
@@ -230,17 +282,10 @@ async def cluster_videos(request: Request):
 
     logger.info("Cluster request authorized.", extra=log_context)
 
-    if not structured_llm:
+    if genai_client is None:
         return JSONResponse(
             {
-                "error": "LLM model is not configured. Check server logs and GOOGLE_GENERATIVE_AI_API_KEY/GOOGLE_API_KEY.",
-            },
-            status_code=500,
-        )
-    if embedding_client is None:
-        return JSONResponse(
-            {
-                "error": "Embedding model is not configured. Check server logs and GOOGLE_GENERATIVE_AI_API_KEY/GOOGLE_API_KEY."
+                "error": "Google GenAI client is not configured. Check server logs and GOOGLE_GENERATIVE_AI_API_KEY/GOOGLE_API_KEY."
             },
             status_code=500,
         )
@@ -363,41 +408,12 @@ async def cluster_videos(request: Request):
             {"error": "No stable clusters could be formed from the provided videos."}, status_code=422
         )
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are an expert market analyst. Name the dominant topic reflected by the cluster.",
-            ),
-            (
-                "human",
-                (
-                    "Given the following information, output a concise title (≤3 words) and a one-sentence "
-                    "description capturing the common theme.\n"
-                    "Summaries:\n---\n{summaries}\n---\n"
-                    "Top keywords: {keywords}\n"
-                    "Top key phrases: {key_phrases}\n"
-                    "Visual elements: {visual_elements}"
-                ),
-            ),
-        ]
-    )
-    chain = prompt | structured_llm
-
     final_topics = []
     for label, videos in clustered_videos.items():
         summaries_text = "\n---\n".join([v["summary"] for v in videos[:50]])
         cluster_stats = _summarize_cluster(videos)
         try:
-            topic_payload = chain.invoke(
-                {
-                    "summaries": summaries_text,
-                    "keywords": ", ".join(cluster_stats["keywords"]) or "n/a",
-                    "key_phrases": ", ".join(cluster_stats["key_phrases"]) or "n/a",
-                    "visual_elements": ", ".join(cluster_stats["visual_elements"]) or "n/a",
-                }
-            )
-            topic_object = Topic(**topic_payload)
+            topic_object = _generate_cluster_topic(summaries_text, cluster_stats)
             final_topics.append(
                 {
                     "topic_name": topic_object.topic_name,
@@ -411,15 +427,6 @@ async def cluster_videos(request: Request):
                 {
                     "topic_name": f"Invalid Topic {label}",
                     "topic_description": "LLM output was not in the expected schema.",
-                    "video_ids": [v["id"] for v in videos],
-                }
-            )
-        except OutputParserException as parser_error:
-            print(f"Parser error on cluster {label}: {parser_error}")
-            final_topics.append(
-                {
-                    "topic_name": f"Unparsed Topic {label}",
-                    "topic_description": "LLM output could not be parsed reliably.",
                     "video_ids": [v["id"] for v in videos],
                 }
             )

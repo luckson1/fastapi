@@ -5,23 +5,6 @@ from fastapi.testclient import TestClient
 import main
 
 
-class DummyPromptTemplate:
-    @classmethod
-    def from_messages(cls, _messages):
-        class DummyPrompt:
-            def __or__(self, _structured_llm):
-                class DummyChain:
-                    def invoke(self_inner, inputs):
-                        return {
-                            "topic_name": "Dummy Topic",
-                            "topic_description": f"Keywords: {inputs['keywords']}",
-                        }
-
-                return DummyChain()
-
-        return DummyPrompt()
-
-
 class DummyClusterer:
     def __init__(self, *args, **kwargs):
         pass
@@ -37,9 +20,7 @@ class DummyClusterer:
 @pytest.fixture
 def cluster_client(monkeypatch):
     main.AUTH_KEY = "test-key"
-    main.structured_llm = object()
-    main.embedding_client = object()
-    monkeypatch.setattr(main, "ChatPromptTemplate", DummyPromptTemplate)
+    main.genai_client = object()
     monkeypatch.setattr(main.hdbscan, "HDBSCAN", DummyClusterer)
 
     def fake_embed_texts(texts):
@@ -50,8 +31,15 @@ def cluster_client(monkeypatch):
     def identity_reduce(vectors):
         return vectors
 
+    def fake_topic_generator(_summaries_text, cluster_stats):
+        return main.Topic(
+            topic_name="Dummy Topic",
+            topic_description=f"Keywords: {', '.join(cluster_stats['keywords'])}",
+        )
+
     monkeypatch.setattr(main, "_embed_texts", fake_embed_texts)
     monkeypatch.setattr(main, "_reduce_and_normalize", identity_reduce)
+    monkeypatch.setattr(main, "_generate_cluster_topic", fake_topic_generator)
     return TestClient(main.app)
 
 
@@ -98,7 +86,7 @@ def test_cluster_endpoint_validates_minimum_payload(cluster_client):
 
 
 def test_cluster_endpoint_llm_not_configured(cluster_client, monkeypatch):
-    monkeypatch.setattr(main, "structured_llm", None)
+    monkeypatch.setattr(main, "genai_client", None)
     response = cluster_client.post(
         "/api/cluster",
         json=_sample_payload(),
