@@ -1,29 +1,20 @@
 from collections import Counter
 from typing import List
 
-from fastapi import FastAPI, HTTPException, status, Depends, Request
+from fastapi import FastAPI, HTTPException, Request
 from langchain_community.document_loaders.youtube import YoutubeLoader, TranscriptFormat
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 import os
 from dotenv import load_dotenv
 import boto3
 import tempfile
+import json
 from llama_parse import LlamaParse
 from llama_index.core import SimpleDirectoryReader
 from markitdown import MarkItDown
 from datetime import datetime, timezone
-from app.screenshot.capture import capture_full_page, ScreenshotError
-from app.storage.s3 import S3Storage
-from app.metrics.prom import (
-    SCREENSHOT_REQUESTS_TOTAL,
-    SCREENSHOT_SUCCESS_TOTAL,
-    SCREENSHOT_FAILURE_TOTAL,
-    SCREENSHOT_LATENCY_SECONDS,
-)
-import time
-from prometheus_client import make_asgi_app
 import logging
 import hdbscan
 import numpy as np
@@ -160,21 +151,10 @@ def _summarize_cluster(videos: List[dict]) -> dict:
         "visual_elements": top_values(visual_counter),
     }
 
-# Create a separate app for the metrics endpoint
-metrics_app = make_asgi_app()
-
-# Dependency to get S3 storage instance
-def get_s3_storage():
-    return S3Storage()
-
 class YouTubeTranscriptRequest(BaseModel):
     url: str
 
-class ScreenshotRequest(BaseModel):
-    url: HttpUrl = Field(..., max_length=2048)
-
 app = FastAPI()
-app.mount("/metrics", metrics_app)
 
 @app.get("/")
 async def root():
@@ -233,63 +213,24 @@ async def convert_to_markdown(request: MarkdownRequest):
         print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail="Markdown conversion failed!")
 
-@app.post("/v1/screenshot", status_code=status.HTTP_201_CREATED)
-async def take_screenshot(request: ScreenshotRequest, storage: S3Storage = Depends(get_s3_storage)):
-    """
-    Accepts a URL, validates it, captures a screenshot, and stores it in S3.
-    """
-    SCREENSHOT_REQUESTS_TOTAL.inc()
-    start_time = time.time()
-    log_extra = {"url": str(request.url)}
-
-    try:
-        # 1. Capture the screenshot
-        logger.info("Starting screenshot capture", extra=log_extra)
-        result = await capture_full_page(str(request.url))
-
-        # Calculate file size in KB
-        file_size_kb = len(result.image_bytes) / 1024
-
-        # 2. Store in S3
-        s3_key = storage.upload_file(result.image_bytes)
-        log_extra["s3_key"] = s3_key
-        logger.info("Screenshot capture and upload successful", extra=log_extra)
-
-        # 3. Return the structured response
-        SCREENSHOT_SUCCESS_TOTAL.inc()
-        return {
-            "s3_key": s3_key,
-            "width": result.width,
-            "height": result.height,
-            "file_size_kb": round(file_size_kb, 2),
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-    except ScreenshotError as e:
-        log_extra["error"] = str(e)
-        logger.error("Screenshot capture failed", extra=log_extra)
-        SCREENSHOT_FAILURE_TOTAL.inc()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Screenshot capture failed: {e}")
-    except Exception as e:
-        log_extra["error"] = str(e)
-        logger.error("An unexpected error occurred", extra=log_extra)
-        SCREENSHOT_FAILURE_TOTAL.inc()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {e}")
-    finally:
-        latency = time.time() - start_time
-        log_extra["latency_seconds"] = latency
-        logger.info("Screenshot request finished", extra=log_extra)
-        SCREENSHOT_LATENCY_SECONDS.observe(latency)
-
-
 @app.post("/api/cluster")
 async def cluster_videos(request: Request):
     """
     Main endpoint to receive video data, perform clustering, and return named topics.
     This function is the request handler; it runs for every API call.
     """
-    if not AUTH_KEY or request.headers.get("Authorization") != f"Bearer {AUTH_KEY}":
+    auth_header = request.headers.get("Authorization")
+    log_context = {"auth_header": auth_header or "<missing>"}
+    if not AUTH_KEY:
+        logger.error("AUTH_KEY is not configured; rejecting cluster request.", extra=log_context)
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    expected_header = f"Bearer {AUTH_KEY}"
+    if auth_header != expected_header:
+        logger.warning("Cluster request provided invalid auth.", extra=log_context)
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    logger.info("Cluster request authorized.", extra=log_context)
 
     if not structured_llm:
         return JSONResponse(
@@ -308,6 +249,14 @@ async def cluster_videos(request: Request):
 
     try:
         videos_data = await request.json()
+        payload_preview = _serialize_payload_for_logging(videos_data)
+        logger.info(
+            "Cluster request payload parsed.",
+            extra={
+                "video_count": len(videos_data) if isinstance(videos_data, list) else "non-list",
+                "payload_preview": payload_preview,
+            },
+        )
         if not isinstance(videos_data, list) or len(videos_data) < 5:
             return JSONResponse(
                 {"error": "Request body must be a JSON array of at least 5 video objects."},
@@ -361,8 +310,10 @@ async def cluster_videos(request: Request):
                     )
                 video["visual_elements"] = raw_visuals
     except ValueError as value_error:
+        logger.warning("Cluster request validation error.", extra={"error": str(value_error)})
         return JSONResponse({"error": str(value_error)}, status_code=400)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Cluster request JSON parsing failed.", extra={"error": str(exc)})
         return JSONResponse({"error": "Invalid or malformed JSON in request body."}, status_code=400)
 
     print(f"Processing {len(videos_data)} videos...")
@@ -505,3 +456,12 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
+def _serialize_payload_for_logging(payload, limit: int = 2000) -> str:
+    """Serialize payloads for logging without overwhelming the log stream."""
+    try:
+        text = json.dumps(payload)
+    except (TypeError, ValueError):
+        text = str(payload)
+    if len(text) > limit:
+        return f"{text[:limit]}...(truncated)"
+    return text
