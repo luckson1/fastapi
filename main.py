@@ -391,7 +391,6 @@ async def cluster_videos(request: Request):
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
-        metric="cosine",
     )
     cluster_labels = clusterer.fit_predict(all_vectors_np)
     print(
