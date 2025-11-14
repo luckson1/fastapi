@@ -23,6 +23,7 @@ import logging
 import hdbscan
 import numpy as np
 from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
 
 # Load environment variables early for local development.
 load_dotenv()
@@ -38,6 +39,9 @@ GOOGLE_GENAI_KEY = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY") or os.environ.
 )
 GENAI_EMBEDDING_MODEL = "gemini-embedding-001"
 GENAI_TEXT_MODEL = "gemini-2.5-flash"
+
+# Minimum number of clusters to return
+MIN_CLUSTERS = 5
 
 
 class Topic(BaseModel):
@@ -393,9 +397,17 @@ async def cluster_videos(request: Request):
         min_samples=min_samples,
     )
     cluster_labels = clusterer.fit_predict(all_vectors_np)
-    print(
-        f"Clustering complete. Found {len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)} topics."
-    )
+
+    # Ensure at least MIN_CLUSTERS clusters by falling back to KMeans if needed
+    non_noise_cluster_count = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+    if non_noise_cluster_count < MIN_CLUSTERS:
+        desired_k = min(len(videos_data), MIN_CLUSTERS)
+        kmeans = KMeans(n_clusters=desired_k, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(all_vectors_np)
+        print(f"HDBSCAN produced {non_noise_cluster_count} clusters; fell back to KMeans with k={desired_k}.")
+
+    final_cluster_count = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+    print(f"Clustering complete. Found {final_cluster_count} topics.")
 
     clustered_videos = {}
     for i, label in enumerate(cluster_labels):
