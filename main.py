@@ -2,10 +2,6 @@ from collections import Counter
 from typing import List
 
 from fastapi import FastAPI, HTTPException, Request
-try:
-    from google import genai
-except ImportError:  # pragma: no cover - dependency guard for local tests
-    genai = None
 from langchain_community.document_loaders.youtube import YoutubeLoader, TranscriptFormat
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
@@ -33,109 +29,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
-# Prefer GOOGLE_GENERATIVE_AI_API_KEY, fall back to GOOGLE_API_KEY if present
-GOOGLE_GENAI_KEY = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY") or os.environ.get(
-    "GOOGLE_API_KEY"
-)
-GENAI_EMBEDDING_MODEL = "gemini-embedding-001"
-GENAI_TEXT_MODEL = "gemini-2.5-flash"
-
 # Minimum number of clusters to return
 MIN_CLUSTERS = 5
 
 
-class Topic(BaseModel):
-    """A structured representation of a video topic cluster."""
-
-    topic_name: str = Field(description="A short, 3-word-or-less title for this topic")
-    topic_description: str = Field(description="A description of what this topic is about.")
-
-
-print("Initializing Google GenAI client...")
-if not GOOGLE_GENAI_KEY:
-    print("FATAL: Google GenAI API key is not configured.")
-    genai_client = None
-elif genai is None:
-    print("FATAL: google-genai package is not installed.")
-    genai_client = None
-else:
-    try:
-        genai_client = genai.Client(api_key=GOOGLE_GENAI_KEY)
-        print("Google GenAI client ready.")
-    except Exception as e:  # pragma: no cover - guard rail for deployment misconfig
-        print(f"FATAL: Could not configure Google GenAI client: {e}")
-        genai_client = None
-
-
 # IMPORTANT: Set your VERCEL_API_KEY as an environment variable in Vercel for security.
 AUTH_KEY = os.environ.get("AUTH_KEY")
-
-
-def _coerce_string_list(values: List, field_name: str, index: int) -> List[str]:
-    """Ensure lists contain clean, comparable string tokens."""
-    if not isinstance(values, list):
-        raise ValueError(f"Field '{field_name}' in video object at index {index} must be a list.")
-
-    coerced: List[str] = []
-    for item in values:
-        if item is None:
-            continue
-        if not isinstance(item, str):
-            try:
-                item = str(item)
-            except Exception as exc:
-                raise ValueError(
-                    f"Field '{field_name}' in video object at index {index} contains non-string items."
-                ) from exc
-        stripped = item.strip()
-        if stripped:
-            coerced.append(stripped)
-    return coerced
-
-
-def _embed_texts(texts: List[str]) -> np.ndarray:
-    """Batch texts through the Google embeddings API and return numpy arrays."""
-    if genai_client is None:
-        raise RuntimeError("Google GenAI client is not configured.")
-
-    if not texts:
-        return np.zeros((0, 0), dtype=np.float32)
-
-    embeddings: List[List[float]] = []
-    batch_size = 32
-    for start in range(0, len(texts), batch_size):
-        chunk = texts[start : start + batch_size]
-        normalized_chunk = [text if text.strip() else " " for text in chunk]
-        for text in normalized_chunk:
-            try:
-                response = genai_client.models.embed_content(
-                    model=GENAI_EMBEDDING_MODEL,
-                    contents=text,
-                )
-            except Exception as exc:  # pragma: no cover - API guard rail
-                raise RuntimeError("Failed to fetch embeddings from Google GenAI.") from exc
-
-            embeddings.append(_extract_embedding_vector(response))
-
-    return np.asarray(embeddings, dtype=np.float32)
-
-
-def _extract_embedding_vector(response) -> List[float]:
-    """Normalize the embed_content response into a raw float vector."""
-    embeddings_data = getattr(response, "embeddings", None)
-    if embeddings_data:
-        first_entry = embeddings_data[0]
-        values = getattr(first_entry, "values", first_entry)
-        return list(values)
-
-    data_entries = getattr(response, "data", None)
-    if data_entries:
-        first_entry = data_entries[0]
-        embedding = getattr(first_entry, "embedding", first_entry)
-        values = getattr(embedding, "values", embedding)
-        return list(values)
-
-    raise RuntimeError("Embedding response did not include vector values.")
 
 
 def _reduce_and_normalize(vectors: np.ndarray) -> np.ndarray:
@@ -151,59 +50,6 @@ def _reduce_and_normalize(vectors: np.ndarray) -> np.ndarray:
     norms[norms == 0] = 1.0
     return vectors / norms
 
-
-def _summarize_cluster(videos: List[dict]) -> dict:
-    keyword_counter: Counter[str] = Counter()
-    phrase_counter: Counter[str] = Counter()
-    visual_counter: Counter[str] = Counter()
-
-    for video in videos:
-        keyword_counter.update(video.get("keywords", []))
-        phrase_counter.update(video.get("key_phrases", []))
-        visuals = [
-            token.strip()
-            for token in video.get("visual_elements", "").split(",")
-            if token.strip()
-        ]
-        visual_counter.update(visuals or [video.get("visual_elements", "")])
-
-    def top_values(counter: Counter[str]) -> List[str]:
-        return [term for term, _ in counter.most_common(8)]
-
-    return {
-        "keywords": top_values(keyword_counter),
-        "key_phrases": top_values(phrase_counter),
-        "visual_elements": top_values(visual_counter),
-    }
-
-
-def _generate_cluster_topic(summaries_text: str, cluster_stats: dict) -> Topic:
-    """Use Google GenAI to summarize a single cluster into a Topic."""
-    if genai_client is None:
-        raise RuntimeError("Google GenAI client is not configured.")
-
-    prompt_text = (
-        "You are an expert market analyst. Name the dominant topic reflected by the cluster.\n"
-        "Return a concise title (no more than 3 words) plus a one-sentence description.\n"
-        f"Summaries:\n---\n{summaries_text}\n---\n"
-        f"Top keywords: {', '.join(cluster_stats['keywords']) or 'n/a'}\n"
-        f"Top key phrases: {', '.join(cluster_stats['key_phrases']) or 'n/a'}\n"
-        f"Visual elements: {', '.join(cluster_stats['visual_elements']) or 'n/a'}"
-    )
-
-    response = genai_client.models.generate_content(
-        model=GENAI_TEXT_MODEL,
-        contents=prompt_text,
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": Topic.model_json_schema(),
-        },
-    )
-    response_text = getattr(response, "text", "") or ""
-    if not response_text.strip():
-        raise RuntimeError("Google GenAI returned an empty response.")
-
-    return Topic.model_validate_json(response_text)
 
 class YouTubeTranscriptRequest(BaseModel):
     url: str
@@ -270,8 +116,7 @@ async def convert_to_markdown(request: MarkdownRequest):
 @app.post("/api/cluster")
 async def cluster_videos(request: Request):
     """
-    Main endpoint to receive video data, perform clustering, and return named topics.
-    This function is the request handler; it runs for every API call.
+    Main endpoint to receive video embeddings, perform clustering, and return cluster assignments.
     """
     auth_header = request.headers.get("Authorization")
     log_context = {"auth_header": auth_header or "<missing>"}
@@ -285,14 +130,6 @@ async def cluster_videos(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     logger.info("Cluster request authorized.", extra=log_context)
-
-    if genai_client is None:
-        return JSONResponse(
-            {
-                "error": "Google GenAI client is not configured. Check server logs and GOOGLE_GENERATIVE_AI_API_KEY/GOOGLE_API_KEY."
-            },
-            status_code=500,
-        )
 
     try:
         videos_data = await request.json()
@@ -312,8 +149,7 @@ async def cluster_videos(request: Request):
 
         required_fields = {
             "id": str,
-            "summary": str,
-            "keywords": list,
+            "vector": list,
         }
         for i, video in enumerate(videos_data):
             for field, field_type in required_fields.items():
@@ -329,33 +165,14 @@ async def cluster_videos(request: Request):
                         },
                         status_code=400,
                     )
-
-            video["keywords"] = _coerce_string_list(video["keywords"], "keywords", i)
-            raw_key_phrases = video.get("key_phrases")
-            if raw_key_phrases is None:
-                video["key_phrases"] = []
-            else:
-                if not isinstance(raw_key_phrases, list):
-                    return JSONResponse(
-                        {
-                            "error": f"Field 'key_phrases' at index {i} has incorrect type. Expected list."
-                        },
+            
+            # Validate vector contents
+            if not all(isinstance(x, (int, float)) for x in video["vector"]):
+                 return JSONResponse(
+                        {"error": f"Field 'vector' at index {i} must contain only numbers."},
                         status_code=400,
                     )
-                video["key_phrases"] = _coerce_string_list(raw_key_phrases, "key_phrases", i)
 
-            raw_visuals = video.get("visual_elements")
-            if raw_visuals is None:
-                video["visual_elements"] = ""
-            else:
-                if not isinstance(raw_visuals, str):
-                    return JSONResponse(
-                        {
-                            "error": f"Field 'visual_elements' at index {i} has incorrect type. Expected str."
-                        },
-                        status_code=400,
-                    )
-                video["visual_elements"] = raw_visuals
     except ValueError as value_error:
         logger.warning("Cluster request validation error.", extra={"error": str(value_error)})
         return JSONResponse({"error": str(value_error)}, status_code=400)
@@ -364,30 +181,12 @@ async def cluster_videos(request: Request):
         return JSONResponse({"error": "Invalid or malformed JSON in request body."}, status_code=400)
 
     print(f"Processing {len(videos_data)} videos...")
-    base_docs: List[str] = []
-    enriched_docs: List[str] = []
-    video_metadata: List[dict] = []
-    for video in videos_data:
-        keywords_text = " ".join(video["keywords"])
-        base_doc = f"{video['summary']} {keywords_text} {video['visual_elements']}".strip()
-        key_phrase_doc = " ".join(video["key_phrases"]) or video["summary"]
-        base_docs.append(base_doc)
-        enriched_docs.append(key_phrase_doc)
-        video_metadata.append(
-            {
-                "id": video["id"],
-                "summary": video["summary"],
-                "keywords": video["keywords"],
-                "key_phrases": video["key_phrases"],
-                "visual_elements": video["visual_elements"],
-            }
-        )
-
-    BASE_WEIGHT = 0.7
-    PHRASE_WEIGHT = 0.3
-    base_vectors = _embed_texts(base_docs)
-    phrase_vectors = _embed_texts(enriched_docs)
-    all_vectors_np = np.hstack([base_vectors * BASE_WEIGHT, phrase_vectors * PHRASE_WEIGHT])
+    
+    # Extract vectors and IDs
+    vectors_list = [v["vector"] for v in videos_data]
+    video_ids = [v["id"] for v in videos_data]
+    
+    all_vectors_np = np.array(vectors_list, dtype=np.float32)
     all_vectors_np = _reduce_and_normalize(all_vectors_np)
 
     min_cluster_size = max(5, int(len(videos_data) * 0.03))
@@ -412,47 +211,24 @@ async def cluster_videos(request: Request):
     clustered_videos = {}
     for i, label in enumerate(cluster_labels):
         if label != -1:
-            clustered_videos.setdefault(label, []).append(video_metadata[i])
+            clustered_videos.setdefault(int(label), []).append(video_ids[i])
 
     if not clustered_videos:
         return JSONResponse(
             {"error": "No stable clusters could be formed from the provided videos."}, status_code=422
         )
 
-    final_topics = []
-    for label, videos in clustered_videos.items():
-        summaries_text = "\n---\n".join([v["summary"] for v in videos[:50]])
-        cluster_stats = _summarize_cluster(videos)
-        try:
-            topic_object = _generate_cluster_topic(summaries_text, cluster_stats)
-            final_topics.append(
-                {
-                    "topic_name": topic_object.topic_name,
-                    "topic_description": topic_object.topic_description,
-                    "video_ids": [v["id"] for v in videos],
-                }
-            )
-        except ValidationError as validation_error:
-            print(f"Validation error on cluster {label}: {validation_error}")
-            final_topics.append(
-                {
-                    "topic_name": f"Invalid Topic {label}",
-                    "topic_description": "LLM output was not in the expected schema.",
-                    "video_ids": [v["id"] for v in videos],
-                }
-            )
-        except Exception as e:
-            print(f"Error processing cluster {label}: {e}")
-            final_topics.append(
-                {
-                    "topic_name": f"Error Topic {label}",
-                    "topic_description": "Could not generate a name for this topic due to a processing error.",
-                    "video_ids": [v["id"] for v in videos],
-                }
-            )
+    final_response = []
+    for label, v_ids in clustered_videos.items():
+        final_response.append(
+            {
+                "cluster_id": label,
+                "video_ids": v_ids,
+            }
+        )
 
     print("Processing complete.")
-    return JSONResponse(final_topics)
+    return JSONResponse(final_response)
 
 
 def custom_openapi():
@@ -481,3 +257,4 @@ def _serialize_payload_for_logging(payload, limit: int = 2000) -> str:
     if len(text) > limit:
         return f"{text[:limit]}...(truncated)"
     return text
+
