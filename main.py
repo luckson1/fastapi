@@ -260,8 +260,8 @@ async def cluster_videos(request: Request):
         noise_vectors = all_vectors_np[noise_indices]
         
         # Run secondary clustering (KMeans)
-        # Heuristic: Aim for clusters of ~20 items, but at least 2 clusters
-        k = max(2, len(noise_vectors) // 20)
+        # Heuristic: Aim for clusters of ~20 items, but at least 3 clusters
+        k = max(3, len(noise_vectors) // 20)
         secondary_labels = perform_kmeans(noise_vectors, k=k)
         
         # Merge labels back
