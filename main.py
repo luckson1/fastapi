@@ -51,6 +51,62 @@ def _reduce_and_normalize(vectors: np.ndarray) -> np.ndarray:
     return vectors / norms
 
 
+def perform_hdbscan(vectors: np.ndarray, min_cluster_size: int = None) -> np.ndarray:
+    """Run HDBSCAN on the given vectors."""
+    if min_cluster_size is None:
+        min_cluster_size = max(5, int(len(vectors) * 0.03))
+    
+    min_samples = max(2, int(min_cluster_size * 0.6))
+    
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+    )
+    return clusterer.fit_predict(vectors)
+
+
+def perform_kmeans(vectors: np.ndarray, k: int) -> np.ndarray:
+    """Run KMeans on the given vectors."""
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    return kmeans.fit_predict(vectors)
+
+
+def assign_noise_to_nearest(vectors: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """Assign noise points (-1) to the nearest cluster centroid."""
+    unique_labels = set(labels)
+    if -1 not in unique_labels:
+        return labels
+        
+    valid_clusters = [l for l in unique_labels if l != -1]
+    if not valid_clusters:
+        return labels
+
+    # Calculate centroids for valid clusters
+    centroids = {}
+    for label in valid_clusters:
+        cluster_points = vectors[labels == label]
+        centroids[label] = np.mean(cluster_points, axis=0)
+
+    # Assign noise points to nearest centroid
+    for i, label in enumerate(labels):
+        if label == -1:
+            point = vectors[i]
+            # Find nearest centroid
+            min_dist = float('inf')
+            nearest_label = -1
+            
+            for c_label, centroid in centroids.items():
+                dist = np.linalg.norm(point - centroid)
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_label = c_label
+            
+            if nearest_label != -1:
+                labels[i] = nearest_label
+                
+    return labels
+
+
 class YouTubeTranscriptRequest(BaseModel):
     url: str
 
@@ -190,20 +246,42 @@ async def cluster_videos(request: Request):
     all_vectors_np = _reduce_and_normalize(all_vectors_np)
 
     min_cluster_size = max(5, int(len(videos_data) * 0.03))
-    min_samples = max(2, int(min_cluster_size * 0.6))
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-    )
-    cluster_labels = clusterer.fit_predict(all_vectors_np)
+    cluster_labels = perform_hdbscan(all_vectors_np, min_cluster_size=min_cluster_size)
+
+    # Calculate Noise Ratio
+    noise_indices = [i for i, l in enumerate(cluster_labels) if l == -1]
+    noise_ratio = len(noise_indices) / len(all_vectors_np)
+    
+    # Conditional Secondary Clustering
+    if noise_ratio > 0.25:
+        print(f"High noise detected ({noise_ratio:.1%}). Re-clustering noise...")
+        
+        # Extract noise vectors
+        noise_vectors = all_vectors_np[noise_indices]
+        
+        # Run secondary clustering (KMeans)
+        # Heuristic: Aim for clusters of ~20 items, but at least 2 clusters
+        k = max(2, len(noise_vectors) // 20)
+        secondary_labels = perform_kmeans(noise_vectors, k=k)
+        
+        # Merge labels back
+        # We need to offset secondary_labels so they don't clash with existing ones
+        max_label = max(cluster_labels)
+        for i, idx in enumerate(noise_indices):
+            cluster_labels[idx] = secondary_labels[i] + max_label + 1
+
+    # Final Cleanup (Nearest Centroid)
+    # If there are still any unclustered points (or if the noise ratio was small to begin with),
+    # assign them to the nearest valid cluster centroid.
+    cluster_labels = assign_noise_to_nearest(all_vectors_np, cluster_labels)
 
     # Ensure at least MIN_CLUSTERS clusters by falling back to KMeans if needed
+    # Note: The logic above might have already increased the cluster count, but we check again.
     non_noise_cluster_count = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
     if non_noise_cluster_count < MIN_CLUSTERS:
         desired_k = min(len(videos_data), MIN_CLUSTERS)
-        kmeans = KMeans(n_clusters=desired_k, random_state=42, n_init=10)
-        cluster_labels = kmeans.fit_predict(all_vectors_np)
-        print(f"HDBSCAN produced {non_noise_cluster_count} clusters; fell back to KMeans with k={desired_k}.")
+        cluster_labels = perform_kmeans(all_vectors_np, k=desired_k)
+        print(f"Still under MIN_CLUSTERS ({non_noise_cluster_count}); fell back to global KMeans with k={desired_k}.")
 
     final_cluster_count = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
     print(f"Clustering complete. Found {final_cluster_count} topics.")
