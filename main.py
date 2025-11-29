@@ -37,74 +37,173 @@ MIN_CLUSTERS = 5
 AUTH_KEY = os.environ.get("AUTH_KEY")
 
 
-def _reduce_and_normalize(vectors: np.ndarray) -> np.ndarray:
-    """Drop the dimensionality and normalize, improving HDBSCAN stability."""
-    n_samples, n_features = vectors.shape
-    if n_samples >= 15 and n_features > 100:
-        max_components = min(100, n_features, n_samples - 1)
-        if max_components >= 10:
-            pca = PCA(n_components=max_components, random_state=42)
-            vectors = pca.fit_transform(vectors)
+class VideoClusterer:
+    def __init__(self, min_clusters: int = 5):
+        self.min_clusters = min_clusters
 
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return vectors / norms
+    def _reduce_and_normalize(self, vectors: np.ndarray) -> np.ndarray:
+        """Drop the dimensionality and normalize, improving HDBSCAN stability."""
+        n_samples, n_features = vectors.shape
+        if n_samples >= 15 and n_features > 100:
+            max_components = min(100, n_features, n_samples - 1)
+            if max_components >= 10:
+                pca = PCA(n_components=max_components, random_state=42)
+                vectors = pca.fit_transform(vectors)
 
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return vectors / norms
 
-def perform_hdbscan(vectors: np.ndarray, min_cluster_size: int = None) -> np.ndarray:
-    """Run HDBSCAN on the given vectors."""
-    if min_cluster_size is None:
-        min_cluster_size = max(5, int(len(vectors) * 0.03))
-    
-    min_samples = max(2, int(min_cluster_size * 0.6))
-    
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-    )
-    return clusterer.fit_predict(vectors)
-
-
-def perform_kmeans(vectors: np.ndarray, k: int) -> np.ndarray:
-    """Run KMeans on the given vectors."""
-    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-    return kmeans.fit_predict(vectors)
-
-
-def assign_noise_to_nearest(vectors: np.ndarray, labels: np.ndarray) -> np.ndarray:
-    """Assign noise points (-1) to the nearest cluster centroid."""
-    unique_labels = set(labels)
-    if -1 not in unique_labels:
-        return labels
+    def _perform_hdbscan(self, vectors: np.ndarray, min_cluster_size: int = None) -> np.ndarray:
+        """Run HDBSCAN on the given vectors."""
+        if min_cluster_size is None:
+            # Cap the growth: max(5, min(20, 3% of data))
+            min_cluster_size = max(5, min(20, int(len(vectors) * 0.03)))
         
-    valid_clusters = [l for l in unique_labels if l != -1]
-    if not valid_clusters:
+        min_samples = max(2, int(min_cluster_size * 0.6))
+        
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+        )
+        return clusterer.fit_predict(vectors)
+
+    def _perform_kmeans(self, vectors: np.ndarray, k: int) -> np.ndarray:
+        """Run KMeans on the given vectors."""
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        return kmeans.fit_predict(vectors)
+
+    def _assign_noise_knn(self, vectors: np.ndarray, labels: np.ndarray) -> np.ndarray:
+        """Assign noise points (-1) to the nearest labeled neighbor using KNN."""
+        from sklearn.neighbors import KNeighborsClassifier
+
+        mask_noise = labels == -1
+        if not np.any(mask_noise):
+            return labels
+            
+        mask_valid = ~mask_noise
+        # If we have no valid clusters, we can't assign noise to anything.
+        if not np.any(mask_valid):
+            return labels
+
+        X_train = vectors[mask_valid]
+        y_train = labels[mask_valid]
+        X_test = vectors[mask_noise]
+
+        knn = KNeighborsClassifier(n_neighbors=1)
+        knn.fit(X_train, y_train)
+        predicted_labels = knn.predict(X_test)
+        
+        labels[mask_noise] = predicted_labels
         return labels
 
-    # Calculate centroids for valid clusters
-    centroids = {}
-    for label in valid_clusters:
-        cluster_points = vectors[labels == label]
-        centroids[label] = np.mean(cluster_points, axis=0)
+    def _ensure_min_clusters(self, vectors: np.ndarray, labels: np.ndarray) -> np.ndarray:
+        """
+        Iteratively split the largest clusters until we reach MIN_CLUSTERS.
+        This preserves existing structure while forcing granularity where needed.
+        """
+        current_cluster_count = len(set(labels)) - (1 if -1 in labels else 0)
+        
+        # Safety break to prevent infinite loops
+        max_iterations = self.min_clusters + 5
+        iteration = 0
 
-    # Assign noise points to nearest centroid
-    for i, label in enumerate(labels):
-        if label == -1:
-            point = vectors[i]
-            # Find nearest centroid
-            min_dist = float('inf')
-            nearest_label = -1
+        while current_cluster_count < self.min_clusters and iteration < max_iterations:
+            iteration += 1
             
-            for c_label, centroid in centroids.items():
-                dist = np.linalg.norm(point - centroid)
-                if dist < min_dist:
-                    min_dist = dist
-                    nearest_label = c_label
-            
-            if nearest_label != -1:
-                labels[i] = nearest_label
+            # Find the largest cluster
+            unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)
+            if len(unique_labels) == 0:
+                break
                 
-    return labels
+            largest_cluster_label = unique_labels[np.argmax(counts)]
+            mask_largest = labels == largest_cluster_label
+            points_in_cluster = vectors[mask_largest]
+            
+            if len(points_in_cluster) < 2:
+                # Can't split a singleton or empty cluster
+                break
+                
+            # Split into 2 sub-clusters
+            sub_labels = self._perform_kmeans(points_in_cluster, k=2)
+            
+            # Reassign labels
+            # One part keeps the old label, the other gets a new max label
+            new_label = np.max(labels) + 1
+            
+            # sub_labels will be 0s and 1s. 
+            # 0s keep 'largest_cluster_label', 1s get 'new_label'
+            # We need to map this back to the original array indices
+            indices_to_update = np.where(mask_largest)[0]
+            
+            # Update only those that are '1' in the sub-clustering
+            indices_for_new_label = indices_to_update[sub_labels == 1]
+            labels[indices_for_new_label] = new_label
+            
+            current_cluster_count += 1
+            print(f"Split cluster {largest_cluster_label} (size {len(points_in_cluster)}) into 2. New count: {current_cluster_count}")
+
+        return labels
+
+    def cluster(self, videos_data: List[dict]) -> List[dict]:
+        print(f"Processing {len(videos_data)} videos...")
+        
+        # Extract vectors and IDs
+        vectors_list = [v["vector"] for v in videos_data]
+        video_ids = [v["id"] for v in videos_data]
+        
+        all_vectors_np = np.array(vectors_list, dtype=np.float32)
+        all_vectors_np = self._reduce_and_normalize(all_vectors_np)
+
+        # 1. Initial HDBSCAN
+        cluster_labels = self._perform_hdbscan(all_vectors_np)
+
+        # 2. Calculate Noise Ratio
+        noise_indices = [i for i, l in enumerate(cluster_labels) if l == -1]
+        noise_ratio = len(noise_indices) / len(all_vectors_np)
+        
+        # 3. Conditional Secondary Clustering
+        # Lowered threshold to 0.25 for earlier intervention
+        if noise_ratio > 0.25:
+            print(f"High noise detected ({noise_ratio:.1%}). Re-clustering noise...")
+            
+            noise_vectors = all_vectors_np[noise_indices]
+            
+            # Secondary pass: aim for small clusters
+            secondary_min_cluster_size = max(3, len(noise_vectors) // 4)
+            secondary_labels = self._perform_hdbscan(noise_vectors, min_cluster_size=secondary_min_cluster_size)
+            
+            # Merge labels back
+            max_label = np.max(cluster_labels) if np.any(cluster_labels != -1) else -1
+            for i, idx in enumerate(noise_indices):
+                sec_label = secondary_labels[i]
+                if sec_label != -1:
+                    cluster_labels[idx] = sec_label + max_label + 1
+
+        # 4. Assign remaining noise using KNN
+        cluster_labels = self._assign_noise_knn(all_vectors_np, cluster_labels)
+
+        # 5. Ensure Minimum Clusters (Iterative Split)
+        cluster_labels = self._ensure_min_clusters(all_vectors_np, cluster_labels)
+
+        final_cluster_count = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+        print(f"Clustering complete. Found {final_cluster_count} topics.")
+
+        clustered_videos = {}
+        for i, label in enumerate(cluster_labels):
+            if label != -1:
+                clustered_videos.setdefault(int(label), []).append(video_ids[i])
+
+        final_response = []
+        for label, v_ids in clustered_videos.items():
+            final_response.append(
+                {
+                    "cluster_id": label,
+                    "video_ids": v_ids,
+                }
+            )
+            
+        return final_response
 
 
 class YouTubeTranscriptRequest(BaseModel):
@@ -236,77 +335,21 @@ async def cluster_videos(request: Request):
         logger.warning("Cluster request JSON parsing failed.", extra={"error": str(exc)})
         return JSONResponse({"error": "Invalid or malformed JSON in request body."}, status_code=400)
 
-    print(f"Processing {len(videos_data)} videos...")
-    
-    # Extract vectors and IDs
-    vectors_list = [v["vector"] for v in videos_data]
-    video_ids = [v["id"] for v in videos_data]
-    
-    all_vectors_np = np.array(vectors_list, dtype=np.float32)
-    all_vectors_np = _reduce_and_normalize(all_vectors_np)
-
-    min_cluster_size = max(5, int(len(videos_data) * 0.03))
-    cluster_labels = perform_hdbscan(all_vectors_np, min_cluster_size=min_cluster_size)
-
-    # Calculate Noise Ratio
-    noise_indices = [i for i, l in enumerate(cluster_labels) if l == -1]
-    noise_ratio = len(noise_indices) / len(all_vectors_np)
-    
-    # Conditional Secondary Clustering
-    if noise_ratio > 0.25:
-        print(f"High noise detected ({noise_ratio:.1%}). Re-clustering noise...")
+    try:
+        clusterer = VideoClusterer(min_clusters=MIN_CLUSTERS)
+        result = clusterer.cluster(videos_data)
         
-        # Extract noise vectors
-        noise_vectors = all_vectors_np[noise_indices]
+        if not result:
+             return JSONResponse(
+                {"error": "No stable clusters could be formed from the provided videos."}, status_code=422
+            )
+            
+        print("Processing complete.")
+        return JSONResponse(result)
         
-        # Run secondary clustering (KMeans)
-        # Heuristic: Aim for clusters of ~20 items, but at least 3 clusters
-        k = max(3, len(noise_vectors) // 20)
-        secondary_labels = perform_kmeans(noise_vectors, k=k)
-        
-        # Merge labels back
-        # We need to offset secondary_labels so they don't clash with existing ones
-        max_label = max(cluster_labels)
-        for i, idx in enumerate(noise_indices):
-            cluster_labels[idx] = secondary_labels[i] + max_label + 1
-
-    # Final Cleanup (Nearest Centroid)
-    # If there are still any unclustered points (or if the noise ratio was small to begin with),
-    # assign them to the nearest valid cluster centroid.
-    cluster_labels = assign_noise_to_nearest(all_vectors_np, cluster_labels)
-
-    # Ensure at least MIN_CLUSTERS clusters by falling back to KMeans if needed
-    # Note: The logic above might have already increased the cluster count, but we check again.
-    non_noise_cluster_count = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-    if non_noise_cluster_count < MIN_CLUSTERS:
-        desired_k = min(len(videos_data), MIN_CLUSTERS)
-        cluster_labels = perform_kmeans(all_vectors_np, k=desired_k)
-        print(f"Still under MIN_CLUSTERS ({non_noise_cluster_count}); fell back to global KMeans with k={desired_k}.")
-
-    final_cluster_count = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
-    print(f"Clustering complete. Found {final_cluster_count} topics.")
-
-    clustered_videos = {}
-    for i, label in enumerate(cluster_labels):
-        if label != -1:
-            clustered_videos.setdefault(int(label), []).append(video_ids[i])
-
-    if not clustered_videos:
-        return JSONResponse(
-            {"error": "No stable clusters could be formed from the provided videos."}, status_code=422
-        )
-
-    final_response = []
-    for label, v_ids in clustered_videos.items():
-        final_response.append(
-            {
-                "cluster_id": label,
-                "video_ids": v_ids,
-            }
-        )
-
-    print("Processing complete.")
-    return JSONResponse(final_response)
+    except Exception as e:
+        logger.error(f"Clustering failed: {str(e)}")
+        return JSONResponse({"error": f"Clustering failed: {str(e)}"}, status_code=500)
 
 
 def custom_openapi():
