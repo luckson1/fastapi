@@ -310,6 +310,14 @@ async def cluster_videos(request: Request):
                 status_code=400,
             )
 
+        # Datasets below 300 should be handled by LLM-based clustering
+        if len(videos_data) < 300:
+            logger.info(f"Dataset size ({len(videos_data)}) below 300. Returning for LLM handling.")
+            return JSONResponse(
+                {"skip_reason": "dataset_too_small", "count": len(videos_data), "threshold": 300},
+                status_code=200,
+            )
+
         required_fields = {
             "id": str,
             "vector": list,
