@@ -43,46 +43,63 @@ class VideoClusterer:
 
     def _get_adaptive_params(self, n_samples: int) -> dict:
         """Calculate optimal UMAP and HDBSCAN parameters based on dataset size."""
-        # n_neighbors: sqrt scaling for better global/local balance
-        n_neighbors = min(max(15, int(np.sqrt(n_samples))), n_samples - 1)
         
-        # n_components: lower for small datasets, higher for large
-        if n_samples < 500:
-            n_components = min(20, n_samples - 2)
-        elif n_samples < 2000:
-            n_components = min(30, n_samples - 2)
-        else:
-            n_components = min(50, n_samples - 2)
+        # Defaults
+        cluster_selection_method = 'eom'
+        cluster_selection_epsilon = 0.0
         
-        # min_cluster_size: scale with dataset size
+        # Small Datasets (< 500)
         if n_samples < 500:
-            min_cluster_size = max(5, int(n_samples * 0.03))
+            # Conservative local structure
+            n_neighbors = max(5, min(10, int(n_samples * 0.1)))
+            n_components = max(5, min(10, n_samples - 2))
+            min_dist = 0.1
+            min_cluster_size = max(3, int(n_samples * 0.05))
+            # 'leaf' prevents over-merging in small datasets
+            cluster_selection_method = 'leaf' 
+            
+        # Medium Datasets (500 - 2000)
         elif n_samples < 2000:
+            n_neighbors = 15
+            n_components = 15
+            min_dist = 0.1
             min_cluster_size = max(10, int(n_samples * 0.02))
+            cluster_selection_epsilon = 0.05 # slight merging of micro-clusters
+            
+        # Large Datasets (> 2000)
         else:
-            min_cluster_size = max(50, int(n_samples * 0.01))
+            n_neighbors = 30
+            n_components = 25
+            min_dist = 0.0 # tight clusters
+            min_cluster_size = max(25, int(n_samples * 0.01))
+            cluster_selection_epsilon = 0.1
         
         return {
-            'n_neighbors': n_neighbors,
-            'n_components': n_components,
-            'min_cluster_size': min_cluster_size,
+            'n_neighbors': int(n_neighbors),
+            'n_components': int(n_components),
+            'min_dist': min_dist,
+            'min_cluster_size': int(min_cluster_size),
             'min_samples': max(2, int(min_cluster_size * 0.6)),
+            'cluster_selection_method': cluster_selection_method,
+            'cluster_selection_epsilon': cluster_selection_epsilon
         }
 
     def _reduce_and_normalize(self, vectors: np.ndarray) -> np.ndarray:
         """Reduce dimensionality using UMAP and normalize for HDBSCAN stability."""
         n_samples, n_features = vectors.shape
         
-        # UMAP requires at least n_neighbors + 1 samples
-        min_samples_for_umap = 15
-        if n_samples >= min_samples_for_umap and n_features > 50:
+        # UMAP requires at least n_neighbors + 1 samples. 
+        # Our smallest n_neighbors is 5, so we need at least 6-7 samples.
+        min_samples_for_umap = 10 
+        
+        if n_samples >= min_samples_for_umap and n_features > 10:
             # Get adaptive parameters based on dataset size
             params = self._get_adaptive_params(n_samples)
             
             reducer = umap.UMAP(
                 n_components=params['n_components'],
                 n_neighbors=params['n_neighbors'],
-                min_dist=0.0,  # Tighter clusters for HDBSCAN
+                min_dist=params['min_dist'],
                 metric='cosine',
                 random_state=42,
                 low_memory=True,
@@ -101,6 +118,8 @@ class VideoClusterer:
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=params['min_cluster_size'],
             min_samples=params['min_samples'],
+            cluster_selection_method=params['cluster_selection_method'],
+            cluster_selection_epsilon=params['cluster_selection_epsilon'],
         )
         return clusterer.fit_predict(vectors)
 
