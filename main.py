@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 import logging
 import hdbscan
 import numpy as np
-from sklearn.decomposition import PCA
+import umap
 from sklearn.cluster import KMeans
 
 # Load environment variables early for local development.
@@ -41,30 +41,66 @@ class VideoClusterer:
     def __init__(self, min_clusters: int = 5):
         self.min_clusters = min_clusters
 
+    def _get_adaptive_params(self, n_samples: int) -> dict:
+        """Calculate optimal UMAP and HDBSCAN parameters based on dataset size."""
+        # n_neighbors: sqrt scaling for better global/local balance
+        n_neighbors = min(max(15, int(np.sqrt(n_samples))), n_samples - 1)
+        
+        # n_components: lower for small datasets, higher for large
+        if n_samples < 500:
+            n_components = min(20, n_samples - 2)
+        elif n_samples < 2000:
+            n_components = min(30, n_samples - 2)
+        else:
+            n_components = min(50, n_samples - 2)
+        
+        # min_cluster_size: scale with dataset size
+        if n_samples < 500:
+            min_cluster_size = max(5, int(n_samples * 0.03))
+        elif n_samples < 2000:
+            min_cluster_size = max(10, int(n_samples * 0.02))
+        else:
+            min_cluster_size = max(50, int(n_samples * 0.01))
+        
+        return {
+            'n_neighbors': n_neighbors,
+            'n_components': n_components,
+            'min_cluster_size': min_cluster_size,
+            'min_samples': max(2, int(min_cluster_size * 0.6)),
+        }
+
     def _reduce_and_normalize(self, vectors: np.ndarray) -> np.ndarray:
-        """Drop the dimensionality and normalize, improving HDBSCAN stability."""
+        """Reduce dimensionality using UMAP and normalize for HDBSCAN stability."""
         n_samples, n_features = vectors.shape
-        if n_samples >= 15 and n_features > 100:
-            max_components = min(100, n_features, n_samples - 1)
-            if max_components >= 10:
-                pca = PCA(n_components=max_components, random_state=42)
-                vectors = pca.fit_transform(vectors)
+        
+        # UMAP requires at least n_neighbors + 1 samples
+        min_samples_for_umap = 15
+        if n_samples >= min_samples_for_umap and n_features > 50:
+            # Get adaptive parameters based on dataset size
+            params = self._get_adaptive_params(n_samples)
+            
+            reducer = umap.UMAP(
+                n_components=params['n_components'],
+                n_neighbors=params['n_neighbors'],
+                min_dist=0.0,  # Tighter clusters for HDBSCAN
+                metric='cosine',
+                random_state=42,
+                low_memory=True,
+                n_jobs=-1,  # Parallelize for performance
+            )
+            vectors = reducer.fit_transform(vectors)
 
         norms = np.linalg.norm(vectors, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         return vectors / norms
 
-    def _perform_hdbscan(self, vectors: np.ndarray, min_cluster_size: int = None) -> np.ndarray:
-        """Run HDBSCAN on the given vectors."""
-        if min_cluster_size is None:
-            # Cap the growth: max(5, min(20, 3% of data))
-            min_cluster_size = max(5, min(20, int(len(vectors) * 0.03)))
-        
-        min_samples = max(2, int(min_cluster_size * 0.6))
+    def _perform_hdbscan(self, vectors: np.ndarray) -> np.ndarray:
+        """Run HDBSCAN on the given vectors with adaptive parameters."""
+        params = self._get_adaptive_params(len(vectors))
         
         clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=min_cluster_size,
-            min_samples=min_samples,
+            min_cluster_size=params['min_cluster_size'],
+            min_samples=params['min_samples'],
         )
         return clusterer.fit_predict(vectors)
 
@@ -73,29 +109,6 @@ class VideoClusterer:
         kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
         return kmeans.fit_predict(vectors)
 
-    def _assign_noise_knn(self, vectors: np.ndarray, labels: np.ndarray) -> np.ndarray:
-        """Assign noise points (-1) to the nearest labeled neighbor using KNN."""
-        from sklearn.neighbors import KNeighborsClassifier
-
-        mask_noise = labels == -1
-        if not np.any(mask_noise):
-            return labels
-            
-        mask_valid = ~mask_noise
-        # If we have no valid clusters, we can't assign noise to anything.
-        if not np.any(mask_valid):
-            return labels
-
-        X_train = vectors[mask_valid]
-        y_train = labels[mask_valid]
-        X_test = vectors[mask_noise]
-
-        knn = KNeighborsClassifier(n_neighbors=1)
-        knn.fit(X_train, y_train)
-        predicted_labels = knn.predict(X_test)
-        
-        labels[mask_noise] = predicted_labels
-        return labels
 
     def _ensure_min_clusters(self, vectors: np.ndarray, labels: np.ndarray) -> np.ndarray:
         """
@@ -155,35 +168,11 @@ class VideoClusterer:
         all_vectors_np = np.array(vectors_list, dtype=np.float32)
         all_vectors_np = self._reduce_and_normalize(all_vectors_np)
 
-        # 1. Initial HDBSCAN
+        # 1. Initial HDBSCAN with adaptive parameters
         cluster_labels = self._perform_hdbscan(all_vectors_np)
 
-        # 2. Calculate Noise Ratio
-        noise_indices = [i for i, l in enumerate(cluster_labels) if l == -1]
-        noise_ratio = len(noise_indices) / len(all_vectors_np)
-        
-        # 3. Conditional Secondary Clustering
-        # Lowered threshold to 0.25 for earlier intervention
-        if noise_ratio > 0.25:
-            print(f"High noise detected ({noise_ratio:.1%}). Re-clustering noise...")
-            
-            noise_vectors = all_vectors_np[noise_indices]
-            
-            # Secondary pass: aim for small clusters
-            secondary_min_cluster_size = max(3, len(noise_vectors) // 4)
-            secondary_labels = self._perform_hdbscan(noise_vectors, min_cluster_size=secondary_min_cluster_size)
-            
-            # Merge labels back
-            max_label = np.max(cluster_labels) if np.any(cluster_labels != -1) else -1
-            for i, idx in enumerate(noise_indices):
-                sec_label = secondary_labels[i]
-                if sec_label != -1:
-                    cluster_labels[idx] = sec_label + max_label + 1
-
-        # 4. Assign remaining noise using KNN
-        cluster_labels = self._assign_noise_knn(all_vectors_np, cluster_labels)
-
-        # 5. Ensure Minimum Clusters (Iterative Split)
+        # 2. Ensure Minimum Clusters (Iterative Split)
+        # Note: Noise points (-1) are excluded from final output
         cluster_labels = self._ensure_min_clusters(all_vectors_np, cluster_labels)
 
         final_cluster_count = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
